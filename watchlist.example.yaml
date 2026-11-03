@@ -1,0 +1,46 @@
+# ウォッチリスト: 「何を探すか」を書くファイル。
+# cp watchlist.example.yaml watchlist.yaml して編集してください。
+
+settings:
+  db_path: data/watcher.db
+  min_score: 70            # この点数以上を通知（クエリごとに上書き可）
+  currency_rates:          # 価格フィルタを円で統一するための換算レート
+    USD: 150
+  request_interval_sec: 3  # 同じサイトへのリクエスト間隔
+  judge:
+    model: claude-opus-5-5
+    effort: low            # low / medium / high。精度が足りなければ上げる
+    use_images: true
+    max_images: 3
+    max_judgements_per_run: 40   # 1回の実行で AI 判定する最大件数（コストの安全弁）
+
+queries:
+  - name: levis-501-66-early
+    # ↓ ここが一番大事。人に頼むつもりで具体的に書くと判定精度が上がる
+    description: |
+      リーバイス 501 の 66前期（1970年代前半）を探しています。
+      - 判別ポイント: 赤タブがスモールe、トップボタン裏刻印「6」、バックポケット裏がシングルステッチ
+      - サイズ: 表記 W32〜W34（実寸 W80〜86cm）
+      - 状態: 色残りが良いものを優先。股やポケットの大きな穴、後加工のダメージ加工はNG
+      - 復刻（LVC）・日本製・現行品は不要
+    keywords:
+      - リーバイス 501 66前期
+      - levis 501 66 前期
+    exclude_words: [LVC, 復刻, レプリカ, 日本製, キッズ]
+    price_min: 15000
+    price_max: 120000
+    sources: [yahoo_auctions, ebay]
+    overrides:
+      ebay:
+        keywords: ["levis 501 66 single stitch", "levis 501 66 early"]
+
+  - name: champion-reverse-weave-70s
+    description: |
+      チャンピオンのリバースウィーブ、単色タグ〜トリコタグ（1970年代〜80年代前半）のスウェット。
+      サイズは L か XL。目立つ汚れやリブの大きな破れは不可。プリントは無地でも大学物でもOK。
+    keywords: [チャンピオン リバースウィーブ 単色タグ, チャンピオン リバースウィーブ トリコタグ]
+    exclude_words: [復刻, 現行]
+    price_max: 60000
+    sources: [yahoo_auctions, instagram]
+    instagram_hashtags: [reverseweave, vintagechampion]
+    min_score: 75

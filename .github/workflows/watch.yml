@@ -1,0 +1,62 @@
+# 定期実行ワークフロー。GitHub のサーバー上で1時間ごとにエージェントを動かす。
+#
+# ポイント:
+# - 秘密情報は リポジトリの Settings > Secrets and variables > Actions に登録する
+# - SQLite（既読DB）は actions/cache で実行間に引き継ぐ。
+#   キャッシュは上書きできないので「毎回ユニークなキーで保存 → 前方一致で最新を復元」する
+# - cron は UTC。:00 は混み合って遅延しやすいので少しずらしている
+name: watch
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch: {}   # Actions タブから手動実行もできる
+
+concurrency:
+  group: watch
+  cancel-in-progress: false   # 同時実行で DB が競合しないように直列化
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install .
+
+      - name: Restore DB
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: watcher-db-${{ github.run_id }}
+          restore-keys: watcher-db-
+
+      - name: Run watcher
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_TO_USER_ID: ${{ secrets.LINE_TO_USER_ID }}
+          EBAY_CLIENT_ID: ${{ secrets.EBAY_CLIENT_ID }}
+          EBAY_CLIENT_SECRET: ${{ secrets.EBAY_CLIENT_SECRET }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+        run: |
+          # DB がまだ無い（初回）なら、既存の出品を既読にするだけにして通知の洪水を防ぐ
+          if [ ! -f data/watcher.db ]; then
+            vintage-watcher run --baseline
+          else
+            vintage-watcher run
+          fi
+
+      - name: Save DB
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: watcher-db-${{ github.run_id }}

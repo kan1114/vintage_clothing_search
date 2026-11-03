@@ -1,0 +1,29 @@
+[project]
+name = "vintage-watcher"
+version = "0.1.0"
+description = "ヴィンテージ古着の新着出品をウォッチし、Claude で目利きして LINE に通知するエージェント"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=2.4.0",
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "respx>=0.21"]
+
+[project.scripts]
+vintage-watcher = "vintage_watcher.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["vintage_watcher*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
