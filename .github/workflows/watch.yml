@@ -1,62 +1,86 @@
-# 定期実行ワークフロー。GitHub のサーバー上で1時間ごとにエージェントを動かす。
+# 定期実行ワークフロー。GitHub のサーバー上で Claude Code をヘッドレス実行し、/watch を動かす。
 #
-# ポイント:
-# - 秘密情報は リポジトリの Settings > Secrets and variables > Actions に登録する
-# - SQLite（既読DB）は actions/cache で実行間に引き継ぐ。
-#   キャッシュは上書きできないので「毎回ユニークなキーで保存 → 前方一致で最新を復元」する
-# - cron は UTC。:00 は混み合って遅延しやすいので少しずらしている
+# - 秘密情報は Settings > Secrets and variables > Actions に登録する
+# - 権限は ci/claude-settings.json の許可リストだけ（--permission-mode dontAsk で、それ以外は自動拒否）
+# - 既読台帳（data/）は actions/cache で実行間に引き継ぐ
+#   （キャッシュは上書きできないので「毎回ユニークなキーで保存 → 前方一致で最新を復元」する）
+# - コスト: 新着が無い回でも約 $0.15〜0.3 かかる（オーケストレーターの固定費）。間隔は README の試算を見て決める
 name: watch
 
 on:
   schedule:
-    - cron: "17 * * * *"
-  workflow_dispatch: {}   # Actions タブから手動実行もできる
+    - cron: "23 */3 * * *"   # 3時間ごと（UTC）。:00 は混み合うので少しずらしている
+  workflow_dispatch:
+    inputs:
+      args:
+        description: "/watch の引数（例: dry-run / baseline / offline dry-run）"
+        required: false
+        default: ""
 
 concurrency:
   group: watch
-  cancel-in-progress: false   # 同時実行で DB が競合しないように直列化
+  cancel-in-progress: false
 
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-node@v4
         with:
-          python-version: "3.12"
-          cache: pip
+          node-version: "22"
 
-      - run: pip install .
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
 
-      - name: Restore DB
+      - name: Restore data
         uses: actions/cache/restore@v4
         with:
           path: data
-          key: watcher-db-${{ github.run_id }}
-          restore-keys: watcher-db-
+          key: watcher-data-${{ github.run_id }}
+          restore-keys: watcher-data-
 
-      - name: Run watcher
+      - name: Run /watch
         env:
+          # どちらか一方を設定（API キー課金 or Claude サブスクリプション）
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           LINE_TO_USER_ID: ${{ secrets.LINE_TO_USER_ID }}
           EBAY_CLIENT_ID: ${{ secrets.EBAY_CLIENT_ID }}
           EBAY_CLIENT_SECRET: ${{ secrets.EBAY_CLIENT_SECRET }}
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          ARGS: ${{ github.event.inputs.args }}
         run: |
-          # DB がまだ無い（初回）なら、既存の出品を既読にするだけにして通知の洪水を防ぐ
-          if [ ! -f data/watcher.db ]; then
-            vintage-watcher run --baseline
-          else
-            vintage-watcher run
-          fi
+          mkdir -p data/logs
+          # 台帳がまだ無い（初回）なら baseline にして、既存の出品が大量に通知されるのを防ぐ
+          if [ -z "$ARGS" ] && ! ls data/ledger/*.jsonl >/dev/null 2>&1; then ARGS=baseline; fi
+          claude -p "/watch $ARGS" \
+            --model sonnet \
+            --settings ci/claude-settings.json \
+            --permission-mode dontAsk \
+            --max-budget-usd 3 \
+            --output-format stream-json --verbose \
+            < /dev/null | tee "data/logs/${{ github.run_id }}.jsonl" \
+            | jq -r 'select(.type=="result") | .result, "cost: $\(.total_cost_usd)"'
 
-      - name: Save DB
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: watch-${{ github.run_id }}
+          path: |
+            data/runs/*/summary.md
+            data/runs/*/*.jsonl
+            data/logs/${{ github.run_id }}.jsonl
+          retention-days: 14
+
+      - name: Save data
         if: always()
         uses: actions/cache/save@v4
         with:
           path: data
-          key: watcher-db-${{ github.run_id }}
+          key: watcher-data-${{ github.run_id }}

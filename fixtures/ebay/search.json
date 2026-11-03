@@ -1,0 +1,26 @@
+{
+  "total": 2,
+  "itemSummaries": [
+    {
+      "itemId": "v1|2260001|0",
+      "title": "Vintage 70s Levis 501 66 Early Single Stitch W33 L32 Small e",
+      "price": {"value": "320.00", "currency": "USD"},
+      "image": {"imageUrl": "https://i.ebayimg.com/images/g/sample1/s-l1600.jpg"},
+      "itemWebUrl": "https://www.ebay.com/itm/2260001",
+      "condition": "Pre-owned",
+      "shortDescription": "Top button #6, single stitch back pockets, small e red tab. Light fade, no holes.",
+      "itemCreationDate": "2026-11-02T22:10:00.000Z",
+      "buyingOptions": ["FIXED_PRICE"]
+    },
+    {
+      "itemId": "v1|2260002|0",
+      "title": "Levis Vintage Clothing LVC 1966 501 Reproduction W34",
+      "price": {"value": "140.00", "currency": "USD"},
+      "image": {"imageUrl": "https://i.ebayimg.com/images/g/sample2/s-l1600.jpg"},
+      "itemWebUrl": "https://www.ebay.com/itm/2260002",
+      "condition": "New with tags",
+      "itemCreationDate": "2026-11-02T20:00:00.000Z",
+      "buyingOptions": ["FIXED_PRICE", "BEST_OFFER"]
+    }
+  ]
+}

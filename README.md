@@ -1,15 +1,18 @@
 # vintage-watcher
 
-ヴィンテージ古着の新着出品を定期的に巡回し、**Claude が「目利き」して、本当に欲しいものだけを LINE に通知する**エージェントです。
+ヴィンテージ古着の新着出品を巡回し、**複数の Claude エージェントが分業して目利きし、本当に欲しいものだけを LINE に通知する**マルチエージェントです。
+
+アプリケーションコードはありません。中身は `.claude/` に置いた **Claude Code のエージェント定義（Markdown）** で、Claude Code が実行エンジンです。
 
 ```
-「リーバイス 501 66前期」で検索 → 50件ヒット
-   ├─ 既読（前回までに見た）         … 45件  → スキップ
-   ├─ ルールで除外（LVC・価格外など） …  2件  → スキップ
-   └─ Claude が写真と説明文を見て判定 …  3件
-         ├─ 92点「スモールe・シングルステッチ確認。W33で条件一致」 → LINE通知
-         ├─ 55点「66後期の可能性が高い」                          → 記録のみ
-         └─ 20点「現行品」                                         → 記録のみ
+/watch
+ ├─ 収集   yahoo-collector ┐
+ │         ebay-collector  ├ 並列（Haiku）
+ │         instagram-collector ┘
+ ├─ 選別   curator         既読除外・ルールフィルタ・件数上限・画像DL（Haiku）
+ ├─ 鑑定   appraiser × クエリ数   並列（Opus）
+ ├─ 検証   authenticator   高得点だけを疑ってかかって再鑑定（Opus）
+ └─ 通知   notifier        LINE 送信と台帳への記録（Haiku）
 ```
 
 ---
@@ -17,304 +20,348 @@
 ## 目次
 
 1. [全体アーキテクチャ](#1-全体アーキテクチャ)
-2. [各コンポーネントの解説](#2-各コンポーネントの解説)
-3. [セットアップ](#3-セットアップ)
-4. [使い方](#4-使い方)
-5. [定期実行（GitHub Actions / 常駐）](#5-定期実行)
-6. [コストの目安](#6-コストの目安)
-7. [メルカリ・ラクマについて](#7-メルカリラクマについて)
-8. [拡張のヒント](#8-拡張のヒント)
+2. [使っているマルチエージェントのパターン](#2-使っているマルチエージェントのパターン)
+3. [ファイル構成と読み方](#3-ファイル構成と読み方)
+4. [権限設計（と検証で分かったこと）](#4-権限設計と検証で分かったこと)
+5. [動かしてみる（offline モード）](#5-動かしてみるoffline-モード)
+6. [本番のセットアップ](#6-本番のセットアップ)
+7. [定期実行とコスト](#7-定期実行とコスト)
+8. [メルカリ・ラクマについて](#8-メルカリラクマについて)
+9. [学習のための改造課題](#9-学習のための改造課題)
 
 ---
 
 ## 1. 全体アーキテクチャ
 
 ```mermaid
-flowchart LR
-    W[watchlist.yaml<br/>欲しいもの定義] --> A
+flowchart TB
+    U["/watch（オーケストレーター = メインのセッション）"]
 
-    subgraph A[WatchAgent.run_once]
-        direction LR
-        S[Sources<br/>取得・正規化] --> D{既読?}
-        D -- 新着 --> F[ルールフィルタ<br/>除外語・価格]
-        F -- 通過 --> J[Judge<br/>Claude で目利き]
-        J -- 基準点以上 --> N[Notifier<br/>LINE]
+    subgraph C[1. 収集 - 並列]
+        Y[yahoo-collector<br/>haiku]
+        E[ebay-collector<br/>haiku]
+        I[instagram-collector<br/>haiku]
     end
+    CU[2. curator<br/>haiku]
+    subgraph A[3. 鑑定 - クエリごとに並列]
+        A1[appraiser<br/>opus]
+        A2[appraiser<br/>opus]
+    end
+    AU[4. authenticator<br/>opus]
+    N[5. notifier<br/>haiku]
 
-    E[eBay Browse API] --> S
-    Y[ヤフオク 検索ページ] --> S
-    I[Instagram Graph API] --> S
-    D <--> DB[(SQLite<br/>既読・判定履歴)]
-    J --> DB
+    U --> C --> CU --> A --> AU --> N
+    N --> LINE[(LINE)]
+
+    FS[("data/runs/&lt;RUN_ID&gt;/*.jsonl<br/>data/ledger/*.jsonl")]
+    C -. 書く .-> FS
+    CU -. 読む/書く .-> FS
+    A -. 読む/書く .-> FS
+    AU -. 読む/書く .-> FS
+    N -. 読む/書く .-> FS
 ```
 
-### 設計で大事にしたこと
+**矢印（実線）はオーケストレーターが渡す「指示と短い報告」だけ**で、出品データそのものは点線のファイル経由で流れます。
 
-| 方針 | 理由 |
+### 各エージェントの役割
+
+| エージェント | モデル | ツール | 仕事 |
+|---|---|---|---|
+| `/watch`（スキル） | 実行時に指定（推奨 sonnet） | Agent, Bash, Read, Write | 工程を分解し、サブエージェントを起動し、報告をまとめる。**自分では出品データを読まない** |
+| `yahoo-collector` | haiku | Bash, Read, Write | ヤフオク検索結果 HTML を取得 → `scripts/to-candidates.sh` で正規化 |
+| `ebay-collector` | haiku | Bash, Read, Write | eBay Browse API（OAuth）で検索 → 正規化 |
+| `instagram-collector` | haiku | Bash, Read, Write | Instagram Graph API でハッシュタグの新着 → 正規化 |
+| `curator` | haiku | Bash, Read, Write | 台帳と突き合わせて新着だけに絞る・除外ワード/価格で落とす・件数上限・画像ダウンロード |
+| `appraiser` | opus | Read, Write, Glob | 写真と説明文から「欲しいものか」を採点。**ネットワーク・シェル権限なし** |
+| `authenticator` | opus | Read, Write, Glob | 高得点だけを反対の立場から見直す（レプリカ・別年代・サイズ違いを疑う） |
+| `notifier` | haiku | Bash, Read, Write | LINE に1通のカルーセルで送信し、台帳を書く。**台帳の唯一の書き手** |
+
+---
+
+## 2. 使っているマルチエージェントのパターン
+
+このリポジトリの一番の学習ポイントです。各パターンが「どのファイルのどこに現れているか」も書いています。
+
+### 2.1 オーケストレーター・ワーカー
+
+監督役が仕事を分解して専門のワーカーに配り、結果を統合する基本形です（`.claude/skills/watch/SKILL.md`）。
+
+Claude Code では **サブエージェントは別のサブエージェントを起動できません**。そのため、監督役はサブエージェントではなく
+**メインのセッションで動くスキル（`/watch`）** として書いています。監督は1階層だけ、という制約は設計の前提になります。
+
+### 2.2 並列ファンアウト
+
+独立した仕事は「1つのメッセージで複数のサブエージェントを同時に起動」すると並列に走ります。
+
+- 収集: サイトごとに3つ同時
+- 鑑定: クエリごとに同時（最大4つ、それ以上は波に分ける）
+
+並列化できるのは**互いの結果に依存しない仕事だけ**です。選別（curator）は全サイトの収集結果が揃わないと始められないので、ここで一度合流します。
+
+### 2.3 コンテキストの分離（ファイル経由の受け渡し）
+
+各サブエージェントは**自分専用のコンテキスト**で動き、最後の報告だけが監督に返ります。
+出品データ（数百件の HTML や JSON）を監督の会話に流すと、すぐコンテキストが溢れてコストも膨らむので、
+データは `data/runs/<RUN_ID>/` のファイルに置き、監督には「何件・エラー有無」だけを返させています。
+
+そのため、エージェント間の**ファイル形式（データ契約）**が重要になります → `.claude/skills/watch/references/data-contracts.md`。
+API 設計のスキーマ定義と同じ役割です。
+
+### 2.4 適材適所のモデル選択
+
+各エージェントの frontmatter の `model:` で、仕事の難しさに合わせてモデルを変えています。
+
+- 機械的な収集・選別・通知 → **haiku**（安くて速い）
+- 写真から年代・真贋を見抜く鑑定 → **opus**（ここに予算を集中）
+
+実測では、1回の実行（鑑定4件）のうち haiku 4エージェント分の合計は約 $0.02 で、費用の大半は鑑定とオーケストレーターでした。
+
+### 2.5 評価者パターン（セカンドオピニオン）
+
+`appraiser` が高得点を付けたものだけを、`authenticator` が**反対の立場から**見直します。
+同じモデルでも「見つける役」と「疑う役」に分けると、楽観的な判断に引きずられにくくなり、誤報（レプリカの通知など）が減ります。
+全件ではなく高得点のものだけを対象にしているので、追加コストは小さく済みます。
+
+### 2.6 決定的な処理は「ツール」にする
+
+初期版では、HTML から出品を抜き出す処理もエージェントに任せていました。検証すると、**同じ入力でも実行ごとに抽出件数が変わり**、
+必須フィールドの付け忘れもありました。
+
+そこで変換・既読判定・検証のような「答えが1つに決まる処理」は `scripts/*.sh`（中身は jq）にして、エージェントはそれを**呼ぶだけ**にしました。
+
+| LLM に任せる | ツールにする |
 |---|---|
-| **ファネル構造**（安い処理 → 高い処理） | LLM 判定は1件ごとにお金と時間がかかる。既読チェック・ルールフィルタで件数を絞ってから Claude に渡す |
-| **流れはコードで固定、判断だけ LLM** | 「取得→フィルタ→判定→通知」は毎回同じ手順。LLM に手順まで考えさせる（自律エージェント型）より、予測しやすく・安く・テストしやすい |
-| **サイト差異はアダプタに閉じ込める** | `Listing` という共通の形に正規化したら、以降の処理はサイトを意識しない。新サイト対応は `sources/` にファイルを1つ足すだけ |
-| **秘密情報と設定を分離** | 「何を探すか」は YAML（コミット可）、APIキーは環境変数（コミット不可） |
-| **失敗に強く** | 1サイトが落ちても他は続行。判定・通知に失敗した出品は既読にせず次回リトライ |
+| どのキーワードで何を取るか、エラー時にどう切り分けるか、除外ワードの判断、鑑定、通知文 | HTML/JSON → 共通形式への変換、台帳との突き合わせ、データ契約の検証 |
 
-### ファイル構成
+「全部エージェント」でも、**エージェントが判断し、ツールが実行する**という分担は残ります。MCP やツール呼び出しと同じ考え方です。
 
-```
-vintage_watcher/
-├── models.py          # Listing / WatchQuery / Judgement（全体で流れるデータ型）
-├── config.py          # watchlist.yaml と .env の読み込み
-├── sources/
-│   ├── base.py        # Source 抽象クラス（レート制限つき）
-│   ├── ebay.py        # eBay 公式 Browse API
-│   ├── yahoo_auctions.py  # ヤフオク検索結果 HTML の解析
-│   └── instagram.py   # Instagram 公式 Graph API（ハッシュタグ検索）
-├── store.py           # SQLite（既読管理・判定履歴・キャッシュ）
-├── filters.py         # ルールベースの事前フィルタ
-├── judge.py           # Claude による目利き ★エージェントの頭脳
-├── notifiers.py       # LINE Messaging API への通知
-├── agent.py           # パイプライン全体の組み立て
-└── cli.py             # コマンドライン
-tests/                 # 外部APIをすべてモックしたテスト
-watchlist.example.yaml # 欲しいもの定義のサンプル
-.github/workflows/     # 定期実行と CI
-```
+### 2.7 最小権限と単一の書き手
+
+- **信頼できないテキストを一番深く読むエージェントほど権限を小さく**: 出品の説明文には第三者が何でも書けます（プロンプトインジェクション）。
+  説明文を精読する `appraiser` / `authenticator` には Read / Write しか与えず、外部に何かを送る手段を持たせていません
+- **台帳に書くのは notifier だけ**: 複数のエージェントが同じファイルに書くと壊れやすいので、書き手を1人にしています。
+  台帳は「1回の実行で1ファイル」の追記専用で、過去のファイルは書き換えません
+- **失敗したら記録しない**: 鑑定できなかったもの・件数上限で後回しにしたもの・LINE 送信に失敗したものは台帳に書かず、次回の実行で自然に再挑戦されます
 
 ---
 
-## 2. 各コンポーネントの解説
-
-### 2.1 データモデル（`models.py`）
-
-すべての処理はこの3つの型だけを扱います。
-
-- **`WatchQuery`**: 欲しいもの。検索キーワード（機械向け）と `description`（Claude 向けの自然言語の説明）を両方持つのがポイント。キーワード検索は「広く拾う」、description は「厳しく選ぶ」役割です
-- **`Listing`**: 各サイトの出品を共通の形に正規化したもの。`(source, item_id)` で一意
-- **`Judgement`**: Claude の判定結果。**この Pydantic クラスがそのまま Claude への出力スキーマになる**ため、`Field(description=...)` は Claude への指示としても読まれます
-
-### 2.2 ソース（`sources/`）
-
-| サイト | 方式 | 補足 |
-|---|---|---|
-| eBay | 公式 Browse API | OAuth のクライアントクレデンシャルでトークンを取得し、`sort=newlyListed` で新着順検索。USD 価格は `currency_rates` で円換算してフィルタ |
-| ヤフオク | 検索結果ページの HTML 解析 | 公開 API がないため。**取得 (HTTP) と解析 (純粋関数 `parse_search_html`) を分離**しているので、サイト改修で壊れてもセレクタ修正だけで済み、保存した HTML でオフラインテストできる |
-| Instagram | 公式 Graph API | ハッシュタグの新着投稿を取得。価格がないので価格フィルタは素通りさせ、Claude がキャプションから判断 |
-
-> ⚠ ヤフオクの HTML 構造は予告なく変わります。テスト用 HTML（`tests/fixtures/yahoo_search.html`）は実ページの構造を模したものなので、
-> 実際に動かして取得件数が 0 件になったら、ブラウザの開発者ツールで実ページの構造を確認し `parse_search_html` のセレクタを調整してください。
-> また、アクセスは低頻度（1時間に1回程度）に保ち、利用規約・robots.txt はご自身で確認してください。
-
-### 2.3 既読管理（`store.py`）
-
-ウォッチ系で一番大事なのは「同じものを二度通知しない」こと。`(クエリ名, ソース, 出品ID)` を主キーにした SQLite テーブルで管理しています。
-
-`status` の遷移:
+## 3. ファイル構成と読み方
 
 ```
-(新着) ──► filtered   ルールで除外 / 判定不能
-       ├─► judged     Claude が判定したが基準点未満
-       ├─► notified   通知済み
-       └─► skipped    --baseline で既読化しただけ
-(未記録のまま) … 判定上限超過・APIエラー・通知失敗 → 次回の実行で再挑戦
+.claude/
+├── skills/watch/
+│   ├── SKILL.md                  # オーケストレーター（/watch）★最初に読む
+│   └── references/
+│       └── data-contracts.md     # エージェント間のファイル形式
+└── agents/                       # サブエージェント定義
+    ├── yahoo-collector.md
+    ├── ebay-collector.md
+    ├── instagram-collector.md
+    ├── curator.md
+    ├── appraiser.md              # ★目利きのプロンプト
+    ├── authenticator.md
+    └── notifier.md
+CLAUDE.md                         # 全エージェント共通の前提（秘密情報・信頼できない入力の扱い）
+ci/claude-settings.json           # 権限の許可リスト（ヘッドレス実行で使う）
+scripts/                          # エージェントが呼ぶ決定的なツール（jq）
+fixtures/                         # offline モード用のサンプルデータ
+watchlist.example.yaml            # 欲しいもの定義
+.github/workflows/watch.yml       # 定期実行
 ```
 
-判定結果は JSON で残るので、`sqlite3 data/watcher.db` で「何点のものがどれくらい来ているか」を振り返ってチューニングに使えます。
+### サブエージェント定義の書き方
 
-### 2.4 ルールフィルタ（`filters.py`）
+```markdown
+---
+name: appraiser                      # 呼び出し名
+description: ヴィンテージ古着の目利き担当。...   # いつ使うかの説明。監督はこれを見て使い分ける
+tools: Read, Write, Glob             # 使えるツール（省略すると全部）。最小権限の要
+model: opus                          # haiku / sonnet / opus / inherit
+---
 
-除外ワード（全角/半角・大小文字の揺れを `NFKC + casefold` で吸収）と価格帯だけをチェックします。
-**「確実に不要」なものだけをルールで落とし、迷うものは Claude に任せる**のがコツです。ルールを厳しくしすぎると取りこぼしが増えます。
-
-### 2.5 Claude による目利き（`judge.py`）★
-
-このエージェントの頭脳です。1件の出品につき1回 Claude API を呼びます。
-
-```python
-response = client.beta.messages.parse(
-    model="claude-opus-5-5",
-    system=SYSTEM_PROMPT,                 # 「古着バイヤー」としての判定基準・採点基準
-    messages=[{"role": "user", "content": [
-        {"type": "image", "source": {"type": "url", "url": "..."}},  # 出品写真（最大3枚）
-        {"type": "text", "text": "## ユーザーが探しているもの ...\n## 出品情報 ..."},
-    ]}],
-    thinking={"type": "adaptive"},        # 必要なときだけ考える
-    output_config={"effort": "low"},      # 思考量のつまみ（low/medium/high）
-    output_format=Judgement,              # ← Pydantic モデルで構造化出力
-    betas=["server-side-fallback-2026-07-01"],
-    fallbacks="default",                  # 拒否時はサーバー側で別モデルが引き継ぐ
-)
-judgement: Judgement = response.parsed_output
+（ここから下がこのエージェントのシステムプロンプト）
 ```
 
-使っている Claude API の機能:
+サブエージェントは**監督との会話を見られません**。だから各定義は「入力として何が渡されるか」「どこに何を書くか」「何を報告するか」まで自己完結させています。
 
-- **Structured Outputs**（`output_format=Judgement`）: 返答が必ずスキーマ通りの JSON になり、SDK が Pydantic インスタンスにしてくれます。「JSON で答えて」とプロンプトでお願いしてパースに失敗する…という問題が起きません
-- **Vision**: 画像を URL のまま渡すと Anthropic 側で取得します。タグ・ステッチ・色落ちなど、古着の判定は写真の情報が決定的なことが多いです。画像が取得できず 400 エラーになったら画像なしで再試行します
-- **Adaptive thinking + effort**: 判定前に Claude がどれだけ考えるかを `effort` で調整します。1件の合否判定なら `low` で十分なことが多く、精度が足りなければ `medium` に上げます
-- **Refusal fallback**: まれに安全上の理由で応答が拒否された場合でも、サーバー側で推奨モデルに自動で切り替えて応答を得ます
+### データの流れ（1回の実行）
 
-**精度を上げる一番の方法は `description` を具体的に書くこと**です。「ヴィンテージの501」より「赤タブがスモールe、トップボタン裏刻印6、バックポケット裏シングルステッチ」の方が、Claude は写真のどこを見ればいいか分かります。
+```
+data/runs/20261103T103403Z/
+├── raw/                          collector が取得した生データ
+├── candidates-ebay.jsonl         collector → curator
+├── new.jsonl                     curator: 台帳に無い新着
+├── triage.jsonl                  curator: 全新着の振り分け（appraise / filtered / deferred）
+├── to_appraise-<query>.jsonl     curator → appraiser
+├── appraisals-<query>.jsonl      appraiser → authenticator / notifier
+├── verdicts.jsonl                authenticator → notifier
+├── line_payload.json             notifier が送った内容
+└── summary.md                    オーケストレーターのまとめ
+data/ledger/20261103T103403Z.jsonl   notifier が書く台帳（次回以降の既読判定に使う）
+```
 
-### 2.6 LINE 通知（`notifiers.py`）
-
-LINE Notify は 2025年3月に終了したため、**LINE Messaging API**（自分専用の公式アカウント＝Bot からのプッシュ）を使います。
-
-無料プランは **月200通** で、「通数」は *送信先人数 × リクエスト回数* で数えます（1リクエストに何枚カードを入れても1通）。
-そのため、1回の巡回で見つかった候補を **Flex Message のカルーセル1通** にまとめて送ります（スコア順に最大12件）。
-写真・価格・スコア・Claude の要約・懸念点がカードで表示され、「出品を見る」ボタンで出品ページに飛べます。
-
-### 2.7 パイプライン（`agent.py`）
-
-上記を組み立てるだけの薄い層です。コストの安全弁として `max_judgements_per_run`（1回の実行で判定する最大件数）があり、超えた分は記録せず次回に回します。
-
-`--baseline` は初回実行用で、今出ている出品を判定せずに全部「既読」にします。これをしないと初回に数百件が判定対象になってしまいます。
+実行後にこれらのファイルを開くと、**各エージェントが何を受け取り何を判断したか**を追跡できます。マルチエージェントのデバッグはここが基本です。
 
 ---
 
-## 3. セットアップ
+## 4. 権限設計（と検証で分かったこと）
 
-### 3.1 インストール
+無人で動かす（`claude -p`）ときは、`--permission-mode dontAsk` で**許可リストにない操作をすべて自動拒否**しています。
+許可リストは `ci/claude-settings.json` にあります。
 
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-cp watchlist.example.yaml watchlist.yaml   # 欲しいものを書く
-cp .env.example .env                        # APIキーを書く
-pytest                                      # テストが通ることを確認
+```json
+"allow": ["Agent", "Read", "Glob", "Grep",
+          "Write(./data/**)", "Edit(./data/**)",          // 書き込みは data/ 配下だけ
+          "Bash(scripts/*.sh *)", "Bash(curl *)", "Bash(jq *)", ...],
+"deny":  ["Read(./.env)", "Bash(env *)", "Bash(rm *)", "Bash(git *)", ...]
 ```
 
-### 3.2 Claude API キー（必須）
+> `.claude/settings.json` に置けば対話実行でも自動で読まれますが、作業中のセッションの権限設定を書き換えることになるため、
+> 今回はエージェント（私）からは作成していません。対話でも同じ権限で使いたい場合は、ご自身で
+> `cp ci/claude-settings.json .claude/settings.json` してください。
 
-1. https://console.anthropic.com でアカウント作成・クレジット購入
-2. API Keys からキーを発行し、`.env` の `ANTHROPIC_API_KEY` に設定
+実際に `claude -p` で動かして分かった「許可ルールに通らない書き方」と、その対策です。各エージェントの定義に「Bash の書き方」として明記しています。
 
-### 3.3 LINE（必須）
-
-1. [LINE Official Account Manager](https://manager.line.biz/) で公式アカウントを作成（無料のコミュニケーションプランでOK）
-2. 設定 → Messaging API → 「Messaging API を利用する」でチャネルを作成
-3. [LINE Developers コンソール](https://developers.line.biz/console/) で作成したチャネルを開き:
-   - **Messaging API設定** タブ → 「チャネルアクセストークン（長期）」を発行 → `LINE_CHANNEL_ACCESS_TOKEN`
-   - **チャネル基本設定** タブ → 一番下の「あなたのユーザーID」（`U` から始まる文字列）→ `LINE_TO_USER_ID`
-4. Messaging API設定タブの QR コードを自分の LINE で読み取り、Bot を **友だち追加**
-5. `vintage-watcher test-line` でテスト通知が届けば完了
-
-### 3.4 eBay（使う場合）
-
-1. https://developer.ebay.com でアカウント作成
-2. Application Keys で **Production** のキーセットを作成
-3. `App ID (Client ID)` → `EBAY_CLIENT_ID`、`Cert ID (Client Secret)` → `EBAY_CLIENT_SECRET`
-4. 米国 eBay 以外を見たい場合は `EBAY_MARKETPLACE`（例: `EBAY_GB`）を変更
-
-### 3.5 Instagram（使う場合）
-
-公式 API のハッシュタグ検索には少し準備が要ります。
-
-1. 自分の Instagram アカウントを **プロアカウント**（ビジネス or クリエイター）に切り替え
-2. Facebook ページを作成し、Instagram アカウントと連携
-3. [Meta for Developers](https://developers.facebook.com/) でアプリを作成し、Instagram Graph API を追加
-4. `instagram_basic` 権限付きのユーザーアクセストークンを取得し、**長期トークン**（約60日有効）に交換 → `IG_ACCESS_TOKEN`
-5. `GET /me/accounts` → ページの `instagram_business_account.id` → `IG_USER_ID`
-
-制約: ハッシュタグは **7日間で30種類まで**（ID は DB にキャッシュするので、同じタグを繰り返し使う分には消費しません）、取得できるのは **直近24時間の投稿のみ** です。長期トークンは期限があるので定期的に更新してください。
-
----
-
-## 4. 使い方
-
-```bash
-# 1. 初回: 今ある出品を既読にする（判定・通知しない）
-vintage-watcher run --baseline
-
-# 2. 動作確認: LINE に送らず結果を画面に出す
-vintage-watcher run --dry-run
-
-# 3. 本番: 見つかったら LINE 通知
-vintage-watcher run
-
-# 判定履歴を見る（チューニングに便利）
-vintage-watcher history --limit 50
-vintage-watcher history --status judged    # 基準点未満で落ちたもの
-
-# 常駐モード（自宅サーバーなど）
-vintage-watcher watch --interval 60
-```
-
-### チューニングのコツ
-
-- **通知が多すぎる** → `min_score` を上げる / `description` に NG 条件を足す / `exclude_words` を足す
-- **取りこぼしがある** → `history --status judged` で低スコアの理由を確認し、`description` を修正 / `keywords` に表記ゆれ（英語・カタカナ・略称）を足す
-- **判定が浅い** → `settings.judge.effort` を `medium` に上げる
-
----
-
-## 5. 定期実行
-
-### GitHub Actions（おすすめ）
-
-`.github/workflows/watch.yml` が1時間ごとに実行します。
-
-1. `watchlist.yaml` をコミット（**プライベートリポジトリ推奨**：欲しいもの・予算が見えるため）
-2. リポジトリの Settings → Secrets and variables → Actions に `.env` と同じ名前で各キーを登録
-3. Actions タブで `watch` を手動実行（`workflow_dispatch`）して動作確認
-
-既読 DB は `actions/cache` で実行間に引き継ぎます（キャッシュは上書きできないので「毎回別キーで保存し、前方一致で最新を復元」するパターン）。
-初回（DB がまだ無いとき）は自動で `--baseline` になります。
-
-注意点:
-- プライベートリポジトリの Actions は無料枠が月2,000分。1回1〜2分 × 24回 × 30日 ≒ 700〜1,500分なので、1時間間隔なら収まる見込みです
-- キャッシュは7日間アクセスがないと消えます（その場合は次回が baseline 扱いになるだけ）
-- クラウドの IP からのアクセスはサイト側にブロックされることがあります。ヤフオクの取得が失敗し続ける場合は自宅 PC やサーバーでの常駐を検討してください
-
-### 自宅 PC / サーバー（cron）
-
-```cron
-17 * * * * cd /path/to/vintage_clothing_search && .venv/bin/vintage-watcher run >> data/cron.log 2>&1
-```
-
----
-
-## 6. コストの目安
-
-| 項目 | 費用 |
+| 拒否されたもの | 対策 |
 |---|---|
-| Claude API（`claude-opus-5-5`: 入力 $4 / 出力 $20 per 100万トークン） | 画像3枚込みで1件あたり入力 約4,000〜5,000 トークン + 出力 数百トークン → **約 $0.02〜0.04 / 件** |
-| LINE | 無料プラン（月200通）内。見つかった回だけ1通 |
-| eBay / Instagram API | 無料 |
-| GitHub Actions | 無料枠内（上記） |
+| `a && b`、`R=...`（変数代入）、`$(...)`、`> file` | 1回の呼び出しで1コマンド。ファイル出力は `curl -o` / `\| tee data/...` / Write ツール |
+| jq の `--arg` と `$変数` | 値はリテラルで埋め込む。環境変数は jq の `env.NAME` で読む |
+| `jq -f script.jq`（明示的に許可しても不可） | 実行可能なラッパー `scripts/*.sh` にして `Bash(scripts/*.sh *)` で許可 |
+| `.claude/` 配下のファイルを Bash から参照 | スクリプトは `scripts/` に置く |
+| 絶対パス（`/home/.../data/...`） | 相対パスで書く（`tee data/*` のルールに一致させる） |
 
-ルールフィルタを通過して Claude に渡る新着が1日20件なら、月 $12〜24 程度です。
-`max_judgements_per_run` が上限の安全弁になります。さらに安くしたい場合は `settings.judge.model` を `claude-haiku-5-5`（入力 $0.10 / 出力 $0.50）に変えると大幅に下がりますが、判定精度は落ちる可能性があるので `--dry-run` で比較してから決めるのがおすすめです。
-
----
-
-## 7. メルカリ・ラクマについて
-
-**このツールではメルカリ・ラクマ（・Yahoo!フリマ）の自動取得は実装していません。**
-
-- いずれも一般公開の検索 API がない
-- メルカリ・ラクマの利用規約は、許可のない自動化された手段でのアクセスを禁止しています。アカウント停止のリスクもあります
-
-代わりに、**公式アプリの「検索条件を保存」→ 新着通知** を使うのが安全で確実です（メルカリ・ラクマとも対応）。
-「アプリの新着通知で広く受け取る」＋「このツールで eBay・ヤフオク・Instagram を目利き付きで監視する」という併用をおすすめします。
-
-将来いずれかのサイトが公式 API を提供した場合は、`sources/` に `Source` を継承したクラスを1つ追加し、`sources/__init__.py` に登録すれば対応できます。
+**最初の試験実行では Bash がほぼ全部拒否されていました。** それでもエージェントは Read / Write で回避して最後まで完走しましたが、その結果は不安定でした。
+「エージェントは止まらずに回避策を取る」ので、**拒否ログ（`permission_denials`）を見ないと問題に気づけません**。これも大事な学びです。
 
 ---
 
-## 8. 拡張のヒント
+## 5. 動かしてみる（offline モード）
 
-ソフトウェアエンジニアとして手を入れたくなりそうなポイント:
-
-- **新しいソースの追加**: 古着屋さんの EC（Shopify なら `/products.json`、BASE など）は公開フィードがあることが多いです。`Source.search()` を実装して `Listing` を返すだけ
-- **キーワード自動生成**: `description` から Claude に表記ゆれの検索キーワード（英語・カタカナ・略称）を提案させるコマンド
-- **Batch API**: 即時性が要らなければ Message Batches API で判定すると料金が半額になります（結果は最大24時間後）
-- **相場判定**: 過去の判定履歴（DB）から同じクエリの価格分布を出し、「相場より安い」をスコアに加味する
-- **フィードバックループ**: LINE の返信（「いいね」「違う」）を Webhook で受けて DB に保存し、プロンプトに few-shot 例として入れる
-
----
-
-## 開発
+API キーなしで（Claude の認証だけで）、サンプルデータを使って全工程を体験できます。
 
 ```bash
-pytest -q        # 外部 API はすべてモック。ネットワーク不要
+npm install -g @anthropic-ai/claude-code   # Claude Code（未導入なら）
+
+# サンプルデータで全工程を実行（LINE 送信・台帳書き込みなし）
+claude -p "/watch offline dry-run" \
+  --settings ci/claude-settings.json --permission-mode dontAsk --max-budget-usd 2
+
+# 結果を見る
+cat data/runs/*/summary.md
+ls data/runs/*/
 ```
+
+対話モードで `claude --settings ci/claude-settings.json` を起動して `/watch offline dry-run` と打てば、
+サブエージェントが並列に起動していく様子をリアルタイムで見られます。
+
+| 引数 | 動作 |
+|---|---|
+| （なし） | 本番。取得 → 選別 → 鑑定 → 真贋チェック → LINE 通知 → 台帳 |
+| `baseline` | 今ある出品を全部「既読」にするだけ（初回に1回。これをしないと初回に大量通知される） |
+| `dry-run` | LINE に送らず、台帳も書かない |
+| `offline` | 出品データを `fixtures/` のサンプルで代用（収集と画像だけに影響）。`offline` 単体なら LINE 送信も行うので疎通確認に使える |
+
+> `fixtures/yahoo_auctions/search.html` はリンクの無い広告カードを1枚含むので、yahoo-collector が「カード3 / 抽出2」と報告するのは正常です。
+> また offline ではヤフオクのサンプルを全クエリで共用するため、チャンピオンのクエリにリーバイスが混ざります（appraiser が低得点を付けます）。
+
+### この環境で確認したこと
+
+`claude -p` で実際に以下を実行し、許可されなかった操作（権限拒否）が0件であることを確認しました。
+
+- `offline dry-run`: 収集 8件 → 新着 8 → 除外 4 → 鑑定 4（2並列） → 真贋チェック → 通知対象 1件
+- `offline`（LINE 未設定）: 送信失敗を報告し、通知予定の出品は台帳に書かれない（次回再通知される）
+- 2回目の実行: 台帳と突き合わせて新着 0件になり、鑑定が走らない
+
+**実サイト（ヤフオク・eBay・Instagram）と LINE への接続は、この環境のネットワーク制限のため未検証です。**
+特にヤフオクの HTML 構造は `scripts/yahoo-to-candidates.jq` の前提と違う可能性があります。その場合は yahoo-collector が件数の検算で異常を報告するので、スクリプトを調整してください。
+
+---
+
+## 6. 本番のセットアップ
+
+1. `cp watchlist.example.yaml watchlist.yaml` して欲しいものを書く。**`description` を具体的に書くほど鑑定精度が上がります**
+   （「ヴィンテージの501」より「赤タブがスモールe、トップボタン裏刻印6、バックポケット裏シングルステッチ」）
+2. `cp .env.example .env` して各キーを書き、`set -a; source .env; set +a` でシェルに読み込む
+   （エージェントは `.env` を直接読めないよう権限で拒否しています）
+3. `claude -p "/watch offline" ...` で LINE にテスト通知が届くか確認
+4. `claude -p "/watch baseline" ...` で既存の出品を既読化
+5. 以降は `claude -p "/watch" ...` を定期実行
+
+### Claude Code の認証
+
+- API キー課金: `ANTHROPIC_API_KEY`
+- Claude のサブスクリプション: `claude setup-token` で発行したトークンを `CLAUDE_CODE_OAUTH_TOKEN` に
+
+### LINE（必須）
+
+LINE Notify は 2025年3月に終了したため、**LINE Messaging API**（自分専用 Bot からのプッシュ）を使います。
+
+1. [LINE Official Account Manager](https://manager.line.biz/) で公式アカウントを作成（無料プランで可）→ 設定 → Messaging API を有効化
+2. [LINE Developers コンソール](https://developers.line.biz/console/) でチャネルを開く
+   - Messaging API設定 → チャネルアクセストークン（長期）→ `LINE_CHANNEL_ACCESS_TOKEN`
+   - チャネル基本設定 → あなたのユーザーID（`U...`）→ `LINE_TO_USER_ID`
+3. Messaging API設定の QR コードで Bot を友だち追加
+
+無料プランは月200通。「通数」は送信回数で数え、1通に何枚カードを入れても1通なので、notifier は見つかったものを1通のカルーセルにまとめます。
+
+### eBay（任意）
+
+[developer.ebay.com](https://developer.ebay.com) で Production のキーセットを作成し、App ID → `EBAY_CLIENT_ID`、Cert ID → `EBAY_CLIENT_SECRET`。
+
+### Instagram（任意）
+
+公式 Graph API のハッシュタグ検索を使います。Instagram をプロアカウントにし、Facebook ページと連携、
+Meta for Developers でアプリを作成して長期アクセストークン（`IG_ACCESS_TOKEN`）と IG ユーザーID（`IG_USER_ID`）を取得します。
+ハッシュタグは7日間で30種類まで、取得できるのは直近24時間の投稿のみです。
+
+---
+
+## 7. 定期実行とコスト
+
+### GitHub Actions
+
+`.github/workflows/watch.yml` が3時間ごとに `claude -p "/watch"` を実行します。
+
+1. `watchlist.yaml` をコミット（プライベートリポジトリ推奨）
+2. Settings → Secrets and variables → Actions に各キーを登録
+3. Actions タブで `watch` を手動実行（引数に `offline dry-run` などを指定可）
+
+台帳は `actions/cache` で引き継ぎ、初回は自動で `baseline` になります。各回の `summary.md` と全エージェントの JSONL は artifact として14日間残るので、後から判断の過程を追えます。
+
+### コスト（offline での実測値）
+
+| 実行内容 | 費用 |
+|---|---|
+| 新着なし（収集 + 選別 + 通知のみ） | 約 $0.24〜0.32 |
+| baseline | 約 $0.27〜0.30 |
+| 鑑定4件 + 真贋チェック | 約 $0.50〜0.67 |
+
+内訳（オーケストレーター sonnet、鑑定4件）: オーケストレーター約 $0.24 / appraiser・authenticator（opus）約 $0.25 / haiku 4エージェント合計 約 $0.02。
+
+**新着が無い回でも固定費がかかる**のが、Python で書く方式との大きな違いです。1時間ごとに回すと月 $150〜200 程度になりうるため、ワークフローは3時間ごと（月 $60 前後 + 鑑定費）にしています。
+`--max-budget-usd 3` が1回あたりの上限、`settings.judge.max_appraisals_per_run` が鑑定件数の上限です。
+サブスクリプション（`CLAUDE_CODE_OAUTH_TOKEN`）で動かす場合は、金額ではなく利用枠を消費します。
+
+固定費を下げる工夫は [9. 学習のための改造課題](#9-学習のための改造課題) を参照してください。
+
+---
+
+## 8. メルカリ・ラクマについて
+
+**メルカリ・ラクマ（・Yahoo!フリマ）の自動取得は実装していません。**
+公開 API がなく、利用規約で許可のない自動アクセスが禁止されているためです（アカウント停止のリスクもあります）。
+
+代わりに **公式アプリの「検索条件を保存」→ 新着通知** を併用してください。将来公式 API が出たら、collector を1つ足すだけで対応できます。
+
+---
+
+## 9. 学習のための改造課題
+
+マルチエージェントの理解を深めるための題材です。
+
+1. **新しい collector を足す**: 古着屋さんの EC（Shopify の `/products.json` など）用に `.claude/agents/shop-collector.md` と変換スクリプトを書き、SKILL.md の表に1行追加する。データ契約さえ守れば他のエージェントは無修正で動くことを確かめる
+2. **オーケストレーターを安くする**: 監督を haiku にした場合、指示の質や並列起動の判断がどう変わるかを `summary.md` と JSONL ログで比較する
+3. **hooks で決定的なガードを入れる**: `SubagentStop` フックで「collector が書いた JSONL を `scripts/check-candidates.sh` で自動検証し、違反があれば差し戻す」。プロンプトでのお願いと、仕組みでの強制の違いを体験できる
+4. **鑑定の並列度を変える**: クエリ単位ではなく「出品1件 = 1 appraiser」にすると、精度・コスト・速度がどう変わるか
+5. **フィードバックループ**: LINE の返信（「いいね」「違う」）を記録し、appraiser のプロンプトに過去の判断例（few-shot）として渡す
+6. **相場エージェント**: 過去の台帳から同じクエリの価格分布を出す `market-analyst` を追加し、authenticator に「相場から外れていないか」の材料を渡す
